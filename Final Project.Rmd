@@ -1,0 +1,318 @@
+---
+title: "Final Project"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(caret)
+library(finalfit)
+library(glmnet)
+library(janitor)
+library(vip)
+library(cutpointr)
+library(ranger)
+library(recipes)
+```
+
+# Exploratory with ADD HEalth dataset
+
+```{r Data Import}
+data <- rio::import(here::here("add.csv"))
+
+data <- data[,c(2:9, 11, 13:21)]
+```
+
+```{r Blueprint}
+outcome <- c('ever_suspended')
+
+id <- c('pid')
+
+numeric <- c("birth_year", 'grade_w1', "extrav", "agree", "consc", "neuro", "open", "anger", "optimism", "anxiety")
+
+categorical <- c("sex", "race", "hispanic", "home_language", "US_born", "race_complex")
+
+for(i in categorical){
+    data[[i]] <- gsub("[[:space:]]", "", data[[i]])
+    data[[i]] <- factor(data[[i]])
+    
+  }
+
+data$ever_suspended <- factor(data$ever_suspended,
+                     labels = c("no", "yes")) %>% 
+  as.numeric() - 1
+
+blueprint <- recipe(x  = data,
+                          vars  = c(id, outcome, categorical, numeric),
+                          roles = c('id','outcome',rep('predictor',16))) %>% 
+  step_indicate_na(all_of(numeric), all_of(categorical)) %>% 
+  step_impute_mean(all_of(numeric)) %>%
+  step_impute_mode(all_of(categorical)) %>%
+  step_dummy(all_of(categorical), one_hot=TRUE) %>% 
+  step_zv(all_of(numeric)) %>%
+  step_num2factor(outcome,
+                  transform = function(x) x + 1,
+                  levels=c('no','yes'))
+
+```
+
+```{r}
+set.seed(12082021)
+
+split <- sample(1:nrow(data), round(nrow(data) * 0.8))
+
+data_tr <- data[split,] %>% 
+  as.data.frame()
+
+data_te <- data[-split,]%>% 
+  as.data.frame()
+```
+
+
+# Logistic Regression No Regularization
+
+```{r 10 fold}
+# Creating 10 folds
+set.seed(12082021)
+data_tr <- data_tr[sample(nrow(data_tr)),]
+
+folds <- cut(seq(1, nrow(data_tr)), 
+             breaks = 10,
+             labels = FALSE)
+
+my.indices <- vector('list',10)
+
+for(i in 1:10){
+ my.indices[[i]] <- which(folds!=i)
+}
+
+cv <- trainControl(method    = "cv",
+                   index           = my.indices,
+                   classProbs      = TRUE,
+                   summaryFunction = mnLogLoss)
+```
+
+```{r}
+require(caret)
+
+caret_mod <- train(blueprint, 
+                          data      = data_tr, 
+                          method    = "glm",
+                          family    = 'binomial',
+                          metric    = 'logLoss',
+                          trControl = cv)
+```
+
+```{r}
+predicted_te <- predict(caret_mod, 
+                        data_te, 
+                        type='prob')
+
+# AUC
+require(cutpointr)
+
+cut.obj <- cutpointr(x     = predicted_te$yes,
+                     class = data_te$ever_suspended)
+
+auc_LR <-  auc(cut.obj)
+
+
+# Confusion matrix (Threshold = 0.5)
+
+pred_class <- ifelse(predicted_te$yes>.5,1,0)
+
+confusion <- table(data_te$ever_suspended, pred_class)
+
+confusion
+
+# TNR
+TNR_LR <- confusion[1,1] / (confusion[1,1] + confusion[1,2])
+
+# FPR
+FPR_LR <- confusion[1,2] / (confusion[1,1] + confusion[1,2])
+
+# TPR
+TPR_LR <- confusion[2,2] / (confusion[2,1] + confusion[2,2])
+
+# Precision
+PRE_LR <- confusion[2,2] / (confusion[1,2] + confusion[2,2])
+
+#Accuracy
+ACC_LR <- (confusion[1,1] + confusion[2,2]) / (confusion[1,2] + confusion[2,1] + confusion[1,1] + confusion[2,2])
+```
+# Logistic Regression with Ridge Penalty
+
+```{r}
+
+cv <- trainControl(method    = "cv",
+                   index           = my.indices,
+                   classProbs      = TRUE,
+                   summaryFunction = mnLogLoss)
+      
+# Hyperparameter tuning grid for ridge penalty (lambda), alpha = 0
+
+grid <- data.frame(alpha = 0, lambda = c(seq(0.008, 0.009, .00001))) 
+                
+
+# Train the model
+caret_logistic_ridge <- caret::train(blueprint, 
+                                     data      = data_tr, 
+                                     method    = "glmnet",
+                                     family    = 'binomial',
+                                     metric    = 'logLoss',
+                                     trControl = cv,
+                                     tuneGrid  = grid)
+
+caret_logistic_ridge$bestTune$lambda
+
+# check the results
+plot(caret_logistic_ridge)
+```
+
+> Based on the above plot and an examination of the tested hyperparamteters, the best tuning parameter is `r caret_logistic_ridge$bestTune$lambda`
+
+# Logistic Regression with Lasso Penalty
+
+```{r}
+# Cross-validation settings
+
+cv <- trainControl(method    = "cv",
+                   index           = my.indices,
+                   classProbs      = TRUE,
+                   summaryFunction = mnLogLoss)
+      
+# Hyperparameter tuning grid for ridge penalty (lambda), alpha = 0
+
+grid <- data.frame(alpha = 1, lambda = seq(0.0016, 0.002, .0001)) 
+
+# Train the model
+caret_logistic_lasso <- caret::train(blueprint, 
+                                     data      = data_tr, 
+                                     method    = "glmnet",
+                                     family    = 'binomial',
+                                     metric    = 'logLoss',
+                                     trControl = cv,
+                                     tuneGrid  = grid)
+
+caret_logistic_lasso
+
+# check the results
+
+plot(caret_logistic_lasso)
+
+caret_logistic_lasso$bestTune
+```
+> Based on the above plot and an examination of the tested hyperparamteters, the best tuning parameter is `r caret_logistic_lasso$bestTune$lambda`
+
+# Evaluate the performance 
+
+```{r 1.5, message=FALSE}
+# RIDGE
+# Predict the probabilities for the observations in the test dataset
+
+predicted_te <- predict(caret_logistic_ridge, data_te, type = 'prob')
+# Compute the AUC
+cut.obj <- cutpointr(x     = predicted_te$yes,
+                     class = data_te$ever_suspended)
+auc_LRr <- auc(cut.obj)
+
+# Confusion matrix assuming the threshold is 0.5
+pred_class <- ifelse(predicted_te$yes > .5, 1, 0)
+
+confusion <- table(data_te$ever_suspended ,pred_class)
+
+# True Negative Rate
+TNR_LRr <- confusion[1,1] / (confusion[1,1]+confusion[1,2])
+
+# False Positive Rate
+FPR_LRr <- confusion[1,2] / (confusion[1,1]+confusion[1,2])
+
+# True Positive Rate
+TPR_LRr <- confusion[2,2] / (confusion[2,1]+confusion[2,2])
+
+# Precision
+PRE_LRr <- confusion[2,2] / (confusion[1,2]+confusion[2,2])
+
+#Accuracy
+ACC_LRr <- (confusion[1,1]+confusion[2,2]) / (confusion[1,2] + confusion[2,1] +
+                                                confusion[1,1]+confusion[2,2])
+
+coefs <- coef(caret_logistic_ridge$finalModel,caret_logistic_ridge$bestTune$lambda)
+length(coefs)
+
+ind   <- order(abs(coefs[,1]),decreasing=T)
+
+############ LASSO
+predicted_te <- predict(caret_logistic_lasso, data_te, type='prob')
+# Compute the AUC
+require(cutpointr)
+
+cut.obj <- cutpointr(x     = predicted_te$yes,
+                     class = data_te$ever_suspended)
+auc_LRl <- auc(cut.obj)
+
+# Confusion matrix assuming the threshold is 0.5
+pred_class <- ifelse(predicted_te$yes>.5,1,0)
+confusion <- table(data_te$ever_suspended,pred_class)
+confusion
+
+# True Negative Rate
+TNR_LRl <- confusion[1,1] / (confusion[1,1]+confusion[1,2])
+
+# False Positive Rate
+FPR_LRl <- confusion[1,2] / (confusion[1,1]+confusion[1,2])
+
+# True Positive Rate
+TPR_LRl <- confusion[2,2] / (confusion[2,1]+confusion[2,2])
+
+# Precision
+PRE_LRl <- confusion[2,2] / (confusion[1,2]+confusion[2,2])
+
+#Accuracy
+ACC_LRl <- (confusion[1,1]+confusion[2,2]) / (confusion[1,2] + confusion[2,1] + 
+                                                confusion[1,1]+ confusion[2,2])
+
+coefs <- coef(caret_logistic_lasso$finalModel,
+              caret_logistic_lasso$bestTune$lambda)
+
+ind   <- order(abs(coefs[,1]),decreasing=T)
+
+tibble(
+      "Model" = c("Logistic Regression", 
+            "Logistic Regression with Ridge Penalty", 
+            "Logistic Regression with Lasso Penalty"),
+  
+      "LogLoss" = c(caret_mod$results$logLoss,
+              min(caret_logistic_ridge$results$logLoss),
+              min(caret_logistic_lasso$results$logLoss)
+              ),
+      
+      "AUC" = c(auc_LR, auc_LRr, auc_LRl),
+      
+      "ACC" = c(ACC_LR, ACC_LRr, ACC_LRl),
+      
+      "TPR" = c(TPR_LR, TPR_LRr, TPR_LRr),
+  
+      "TNR" = c(TNR_LR, TNR_LRr, TNR_LRl),
+  
+      "FPR" = c(FPR_LR, FPR_LRr, FPR_LRl),
+        
+      "PRE" = c(PRE_LR, PRE_LRr, PRE_LRl)
+      
+) %>% knitr::kable()
+```
+
+```{r}
+require(vip)
+
+vip(caret_logistic_lasso, 
+    num_features = 10, 
+    geom = "point") + 
+  theme_bw()
+```
